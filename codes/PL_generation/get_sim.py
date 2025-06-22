@@ -1,3 +1,8 @@
+import sys
+import os
+main_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(main_dir)
+
 import numpy as np
 import torch
 from torchvision import transforms
@@ -5,7 +10,7 @@ from PIL import Image
 from torch.nn import functional as F
 import torchvision.transforms.functional as TF
 from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
-import os
+from tqdm import tqdm
 
 from models.encoder_clip import VisionTransformer
 
@@ -39,7 +44,7 @@ ego_obj_dict = torch.load(os.path.join(data_dir, split_type, "trainset", "det_wh
 
 
 os.makedirs(os.path.join(data_dir, split_type, "trainset", save_name))
-for verb in os.listdir(os.path.join(data_dir, split_type, "trainset", "egocentric")):
+for verb in tqdm(os.listdir(os.path.join(data_dir, split_type, "trainset", "egocentric"))):
     for noun in os.listdir(os.path.join(data_dir, split_type, "trainset", "egocentric", verb)):
         exo_feats = []
         image_feats = []
@@ -65,7 +70,7 @@ for verb in os.listdir(os.path.join(data_dir, split_type, "trainset", "egocentri
         
         i = 0
         for p in os.listdir(os.path.join(data_dir, split_type, "trainset", "exocentric", verb, noun)):
-            exo_p = os.path.join(data_dir, split_type, "trainset", "egocentric", verb, noun, p)
+            exo_p = os.path.join(data_dir, split_type, "trainset", "exocentric", verb, noun, p)
             exo = Image.open(exo_p)
             exo = transform_noresize(exo)
             filename = exo_p.split('/')[-1]
@@ -88,7 +93,7 @@ for verb in os.listdir(os.path.join(data_dir, split_type, "trainset", "egocentri
         image_feats = image_feats / image_feats.norm(dim=1, keepdim=True)
         exo_feats = exo_feats / exo_feats.norm(dim=1, keepdim=True)
         sim = image_feats @ exo_feats.permute(1, 0)
-        print(verb, noun, sim.argmax(dim=1))
+        # print(verb, noun, sim.argmax(dim=1))
         assert sim.shape[0] == len(image_dict) and sim.shape[1] == len(exo_dict_rev)
         np.save(os.path.join(data_dir, split_type, "trainset", save_name, f"{verb}_{noun}.npy"), 
                 {"sim":sim.numpy(), "image_dict":image_dict, "exo_dict_rev":exo_dict_rev})
