@@ -216,7 +216,7 @@ def main(config, seed):
                 aff_res, sim_loss, exo_cls_res, pred_noun, pred_part = model(
                     batch_data["input_image"], batch_data["sent_feats"], 
                     batch_data["exo_image"], 
-                    batch_data["exo_objbox_mask_patch"], num_exo=config["num_exo"],
+                    batch_data["exo_objbox_mask_patch"], config["num_exo"],
                 )
             else:
                 aff_res, pred_noun, pred_part = model(

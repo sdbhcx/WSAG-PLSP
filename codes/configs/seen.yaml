@@ -1,10 +1,10 @@
 work_dir: &work_dir logs/seen
 deterministic: False
 
-data_dir: /path/to/AGD20K
+data_dir: /mnt/sdb/wyn/autodl-tmp/AGD20K
 
 load:
-  encoder_ckpt: /path/to/ViT-B-16.pt
+  encoder_ckpt: /mnt/sdb/wyn/autodl-tmp/ViT-B-16.pt
   all_ckpt: # leave blank for training
 
 batch_size: 10 # real batch size = batch_size * accum_iter
