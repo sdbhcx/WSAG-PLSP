@@ -64,20 +64,38 @@ class ModelAGDsup(nn.Module):
             nn.Linear(512, 512)
         )
         
+        self.proto_projector = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Linear(512, 512)
+        )
+        
         
     def forward(self, imgs, text_feat, exo=None, exo_obj_mask=None, num_exo=1):
+        # 1. 提取第一视角图像特征
         _, x = self.encoder(imgs)
-        
+
+        proj_x = self.proto_projector(x)
+        # 2. 处理动作语义特征
         v = text_feat.float().unsqueeze(1)
+        # 3. 预测物体特征
         pred_noun = self.noun_transform(x[:, 0:1, ].detach()) 
+        # 4. 融合物体特征和动作语义特征
         pred_part = self.reason(torch.cat([pred_noun, v], dim=2))
+        # 使用 verb_fuser 网络融合视觉特征和融合后的特征
         aff_token, _, _ = self.verb_fuser(x, pred_part+v)
         
         pred_heatmap = self.pred_decoder(x, aff_token)
+
+        # 利用掩码构建可靠的原型
+        # 构建自我中心图像的原型
+        
         
         if exo is not None:
             # with torch.no_grad():
             _, exo = self.encoder(exo)
+            proj_exo = self.proto_projector(exo)
+
             exo_token = (exo[:, 1:] * exo_obj_mask).sum(dim=1)
             D = aff_token.shape[-1]
             aff_token_expand = aff_token.expand(-1, num_exo, -1).reshape(-1, D)

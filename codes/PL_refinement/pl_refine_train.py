@@ -36,7 +36,81 @@ def set_random_seed(seed, deterministic=False):
     return INTERPOLATE_MODE
 
 
+
+def pixel_contrast_loss(features, pos_masks, neg_masks, num_pos=50, num_neg=50, tau=0.1):
+    """
+    features: [B, C, H, W]
+    pos_masks: [B, H, W] (bool or float 0/1)
+    neg_masks: [B, H, W]
+    """
+    B, C, H, W = features.shape
+    features = features.permute(0, 2, 3, 1).reshape(B, -1, C) # [B, HW, C]
+    features = F.normalize(features, dim=-1) # Normalize features
+    
+    pos_masks = pos_masks.reshape(B, -1)
+    neg_masks = neg_masks.reshape(B, -1)
+    
+    total_loss = 0
+    valid_batches = 0
+    
+    for b in range(B):
+        # Extract indices
+        pos_indices = torch.nonzero(pos_masks[b]).squeeze(-1)
+        neg_indices = torch.nonzero(neg_masks[b]).squeeze(-1)
+        
+        n_p = pos_indices.numel()
+        n_n = neg_indices.numel()
+        
+        if n_p < 2 or n_n < 2:
+            continue
+            
+        # Sampling
+        if n_p > num_pos:
+            idx = torch.randperm(n_p)[:num_pos]
+            pos_indices = pos_indices[idx]
+        if n_n > num_neg:
+            idx = torch.randperm(n_n)[:num_neg]
+            neg_indices = neg_indices[idx]
+            
+        cur_n_pos = pos_indices.numel()
+        cur_n_neg = neg_indices.numel()
+        
+        # Get features [N, C]
+        q_pos = features[b, pos_indices] # [cur_n_pos, C]
+        q_neg = features[b, neg_indices] # [cur_n_neg, C]
+        
+        # Compute similarities
+        sim_pos_pos = torch.mm(q_pos, q_pos.t()) / tau
+        sim_pos_neg = torch.mm(q_pos, q_neg.t()) / tau
+        
+        # Denominator for i: sum(exp(pos)) + sum(exp(neg))
+        exp_pos = torch.exp(sim_pos_pos)
+        exp_neg = torch.exp(sim_pos_neg)
+        
+        denom = exp_pos.sum(dim=1) + exp_neg.sum(dim=1) # [N_p]
+        
+        # Numerator term for each i: sum_{j!=i} log(exp(pos_ij)) - (cur_n_pos - 1) * log(denom_i)
+        
+        mask = torch.eye(cur_n_pos, device=features.device).bool()
+        
+        log_denom = torch.log(denom + 1e-8)
+        
+        sim_pos_pos_masked = sim_pos_pos.clone()
+        term1 = sim_pos_pos_masked[~mask].sum() 
+        term2 = log_denom.sum() * (cur_n_pos - 1)
+        
+        batch_loss = - (term1 - term2) / (cur_n_pos * (cur_n_pos - 1) + 1e-8)
+        
+        total_loss += batch_loss
+        valid_batches += 1
+        
+    if valid_batches > 0:
+        return total_loss / valid_batches
+    else:
+        return torch.tensor(0.0, device=features.device, requires_grad=True)
+
 def parse_args():
+
     parser = argparse.ArgumentParser(description='Finetuning on AGD20K')
     parser.add_argument('--config', type=str, help='Path to the configuration file', required=True)
     parser.add_argument('--seed', type=int, help='Seed', required=True)
@@ -214,6 +288,7 @@ def main(config, seed):
             break
         model.train()
         all_CLIP_align_loss = 0.0
+        all_pix_contrast_loss = 0.0
         all_num = 0
         acc_num = 0
         logger.info(f"============Training Epoch {epoch}============")
@@ -222,9 +297,11 @@ def main(config, seed):
                 break
             
             # get predicted logits: Bx1xLxL
-            aff_res = model(
+            # 自我中心图像的预测掩码和exo图像的特征
+            aff_res, exo_feat = model(
                 batch_data["input_image"], # 224x224
                 batch_data["part_feats"], 
+                batch_data["exo_image"], # 224x224
             )
             L = aff_res.shape[-1]
             
@@ -277,6 +354,38 @@ def main(config, seed):
             
             
             cur_loss = loss_config["CLIP_align_coeff"] * CLIP_align_loss
+            
+            # --- Pixel Contrastive Loss ---
+            thresh_pos = loss_config.get("pix_contrast_thresh", 0.5)
+            # pred_mask_bin_crop is [B, 1, 14, 14]
+            B_pos = (pred_mask_bin_crop > thresh_pos).float().squeeze(1) # [B, 14, 14]
+            
+            # M_obj_ego needs to be fetched and interpolated
+            if "input_obj_region_obj_mask" in batch_data:
+                M_obj_ego = F.interpolate(batch_data["input_obj_region_obj_mask"].cuda(), size=14, mode='nearest').squeeze(1)
+                M_obj_ego = (M_obj_ego > 0.5).float()
+            else:
+                 # Fallback if key missing (though updated data_refine should have it)
+                 M_obj_ego = torch.ones_like(B_pos).cuda()
+                 
+            B_neg_background = 1 - M_obj_ego
+            B_neg_object = M_obj_ego * (1 - B_pos)
+            B_neg = (B_neg_background.bool() | (B_neg_object > 0.5).bool()).float()
+            
+            pix_contrast_loss_val = pixel_contrast_loss(
+                input_CLIP_feat, 
+                B_pos, 
+                B_neg, 
+                num_pos=loss_config.get("pix_contrast_num_pos", 50),
+                num_neg=loss_config.get("pix_contrast_num_neg", 50),
+                tau=loss_config.get("pix_contrast_tau", 0.1)
+            )
+            
+            pix_contrast_coeff = loss_config.get("pix_contrast_coeff", 0.1) # Default 0.1
+            cur_loss += pix_contrast_coeff * pix_contrast_loss_val
+            all_pix_contrast_loss += pix_contrast_loss_val.detach().item()
+            # ------------------------------
+
             all_num += 1
             all_CLIP_align_loss += CLIP_align_loss.detach().item()
             
@@ -325,6 +434,8 @@ def main(config, seed):
             lr_scheduler.step()
         logger.info(
             f"CLIP align loss: {all_CLIP_align_loss / all_num}")
+        logger.info(
+            f"Pix Contrast loss: {all_pix_contrast_loss / all_num}")
         logger.info(
             f"learning rate:{optimizer.state_dict()['param_groups'][0]['lr']}\n")
         

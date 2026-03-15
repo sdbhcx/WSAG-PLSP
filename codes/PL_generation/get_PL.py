@@ -267,6 +267,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_name", type=str, default="PL", help="the name of the directory to save the generated masks"
     )
+    parser.add_argument(
+        "--save_obj_mask", action="store_true", help="whether to save the object mask"
+    )
+    parser.add_argument(
+        "--obj_mask_output_name", type=str, default="obj_masks", help="the directory to save the object masks"
+    )
     # parser.add_argument("--input_image", type=str, required=True, help="path to image file")
     # parser.add_argument("--text_prompt", type=str, required=True, help="text prompt")
     # parser.add_argument("--output_dir", type=str, default="outputs", required=True, help="output directory")
@@ -386,8 +392,70 @@ if __name__ == "__main__":
                     # Convert the numpy array to a PIL Image
                     mask = Image.fromarray(mask, mode='L')  # 'L' mode for grayscale
                     # Save the PIL Image as a grayscale image
-                    assert not os.path.exists(image_path.replace("egocentric", output_name).replace(".jpg", "_pl.png"))
-                    mask.save(image_path.replace("egocentric", output_name).replace(".jpg", "_pl.png"))
+                    
+                    pl_path = image_path.replace("egocentric", output_name).replace(".jpg", "_pl.png")
+                    if os.path.exists(pl_path):
+                        pass # warnings.warn(f"File {pl_path} already exists, skipping part mask save")
+                    else:
+                        mask.save(pl_path)
+                    
+                # --- 2. Save Object Mask (New Logic) ---
+                if save_obj_mask:
+                    # Use NOUN as text prompt to detect the WHOLE object
+                    with torch.no_grad():
+                        predictions_obj = vlpart.inference([inputs], text_prompt=noun.replace("_", " "))[0]
+
+                    filter_boxes_obj = []
+                    if "instances" in predictions_obj:
+                        instances_obj = predictions_obj['instances'].to('cpu')
+                        boxes_obj = instances_obj.pred_boxes.tensor if instances_obj.has("pred_boxes") else None
+                        scores_obj = instances_obj.scores if instances_obj.has("scores") else None
+                        
+                        num_obj_det = len(scores_obj) if scores_obj is not None else 0
+                        
+                        # Filtering logic similar to parts
+                        for obj_ind in range(num_obj_det):
+                            category_score = scores_obj[obj_ind]
+                            if category_score > 0.5:
+                                filter_boxes_obj.append(boxes_obj[obj_ind])
+                        
+                        if len(filter_boxes_obj) == 0 and num_obj_det > 0:
+                            # Fallback to top-1 if no high confidence detection
+                            best_idx = torch.argmax(scores_obj)
+                            filter_boxes_obj = [boxes_obj[best_idx]]
+
+                    if len(filter_boxes_obj) > 0:
+                        # Feed boxes to SAM
+                        # Note: sam_predictor.set_image(original_image) might be called above
+                        if len(filter_boxes) == 0:
+                             sam_predictor.set_image(original_image)
+                        
+                        boxes_filter_obj = torch.stack(filter_boxes_obj)
+                        transformed_boxes_obj = sam_predictor.transform.apply_boxes_torch(boxes_filter_obj, original_image.shape[:2])
+                        
+                        masks_obj, _, _ = sam_predictor.predict_torch(
+                            point_coords=None,
+                            point_labels=None,
+                            boxes=transformed_boxes_obj.to(device),
+                            multimask_output=False,
+                        )
+                        
+                        if masks_obj.shape[0] > 0:
+                            # Combine all instance masks (Union)
+                            combined_mask_obj = masks_obj.sum(dim=0).squeeze(0) # [H, W]
+                            combined_mask_obj = (combined_mask_obj > 0).float()
+                            
+                            # Resize/Interpolate to match original image size properly
+                            combined_mask_obj = combined_mask_obj.unsqueeze(0).unsqueeze(0)
+                            combined_mask_obj = torch.nn.functional.interpolate(combined_mask_obj, size=[height, width], mode="nearest").squeeze()
+
+                            combined_mask_obj_np = (combined_mask_obj.cpu().numpy() * 255).astype(np.uint8)
+                            
+                            # Construct path
+                            obj_mask_path = image_path.replace("egocentric", obj_mask_output_name).replace(".jpg", "_obj.png")
+                            
+                            if not os.path.exists(obj_mask_path):
+                                Image.fromarray(combined_mask_obj_np, mode='L').save(obj_mask_path)
     
     
     # # draw output image

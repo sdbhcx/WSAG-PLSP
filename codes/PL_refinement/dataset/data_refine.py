@@ -164,6 +164,12 @@ class DatasetAGD_train(torch.utils.data.Dataset):
         input_shape_padded = input_img_no_resize_padded.shape[-1]
         input_img = F.interpolate(input_img_no_resize_padded.unsqueeze(0), size=256, mode='bilinear').squeeze(0)
         
+        # load egocentric object whole mask
+        ego_whole_obj_mask_noresize = torch.tensor(np.array(Image.open(
+            input_p.replace("egocentric", self.obj_mask_dir_name).replace(".jpg", "_pl.png")
+        ))).float() / 255.
+        ego_whole_obj_mask_noresize_padded, _, _ = pad_to_square(ego_whole_obj_mask_noresize.unsqueeze(0))
+        
         # egocentric object box
         ego_boxes, ego_scores = self.ego_obj_dict[verb][noun][input_p.split('/')[-1]]
         ego_box_id = np.random.randint(0, len(ego_boxes))
@@ -261,6 +267,11 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             int(obj_box_in_rand_crop_box_noresize[1]):int(obj_box_in_rand_crop_box_noresize[3]), 
             int(obj_box_in_rand_crop_box_noresize[0]):int(obj_box_in_rand_crop_box_noresize[2])
             ]
+        ego_obj_region_obj_mask_noresize = ego_whole_obj_mask_noresize_padded[
+            :, 
+            int(obj_box_in_rand_crop_box_noresize[1]):int(obj_box_in_rand_crop_box_noresize[3]), 
+            int(obj_box_in_rand_crop_box_noresize[0]):int(obj_box_in_rand_crop_box_noresize[2])
+            ]
         
         # print(obj_box_in_rand_crop_box_noresize, obj_box_after_crop)
         if int(obj_box_in_rand_crop_box_noresize[3]) <= int(obj_box_in_rand_crop_box_noresize[1]) \
@@ -269,11 +280,15 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             print("bad crop ego", input_p, input_objbox_mask.sum())
             all_crop_weights[:] = 0.
             ego_obj_region = torch.zeros(3, 224, 224)
+            ego_obj_region_obj_mask = torch.zeros(1, 224, 224)
             obj_box_after_crop = [0, 0, 224, 224]
         else:
             assert obj_box_after_crop[2] != obj_box_after_crop[0] and obj_box_after_crop[3] != obj_box_after_crop[1]
             ego_obj_region_noresize_padded, _, _ = pad_to_square(ego_obj_region_noresize)
             ego_obj_region = F.interpolate(ego_obj_region_noresize_padded.unsqueeze(0), size=self.img_size, mode="bilinear").squeeze(0)
+            
+            ego_obj_region_obj_mask_noresize_padded, _, _ = pad_to_square(ego_obj_region_obj_mask_noresize.unsqueeze(0))
+            ego_obj_region_obj_mask = F.interpolate(ego_obj_region_obj_mask_noresize_padded.unsqueeze(0), size=self.img_size, mode="bilinear").squeeze(0)
             
 
         # apply random flip to egocentric image & obj box
@@ -281,11 +296,12 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             input_img = torch.flip(input_img, dims=[2])
             input_objbox_mask = torch.flip(input_objbox_mask, dims=[2])
             ego_obj_region = torch.flip(ego_obj_region, dims=[2])
+            ego_obj_region_obj_mask = torch.flip(ego_obj_region_obj_mask, dims=[2])
             obj_box_after_crop[0], obj_box_after_crop[2] = 224 - obj_box_after_crop[2], 224 - obj_box_after_crop[0]
         
         return input_img, all_exo_imgs, input_shape, sent_feat, noun_feat, part_feat, \
             verb, noun, obj_box_after_crop, \
-                ego_obj_region, all_exo_obj_regions, all_exo_obj_region_obj_masks, all_crop_weights
+                ego_obj_region, all_exo_obj_regions, all_exo_obj_region_obj_masks, all_crop_weights, ego_obj_region_obj_mask
 
     
     def get_input_image_back(self, x):
@@ -326,7 +342,7 @@ def collate_fn_train(batch):
     input_imgs, exo_imgs, input_shapes, \
         sent_feats, noun_feats, part_feats, verbs, nouns, \
             ego_obj_boxs_after_crop, ego_obj_region, exo_obj_region, \
-                exo_obj_region_obj_mask, crop_weights, \
+                exo_obj_region_obj_mask, crop_weights, ego_obj_region_obj_mask \
                 = list(zip(*batch))
     input_imgs = torch.stack(input_imgs, dim=0) # B 3 H W
     exo_imgs = torch.cat(exo_imgs, dim=0) # B*N 3 H W
@@ -342,6 +358,7 @@ def collate_fn_train(batch):
         
         "input_obj_boxs": ego_obj_boxs_after_crop,
         "input_obj_region": torch.stack(ego_obj_region, dim=0),
+        "input_obj_region_obj_mask": torch.stack(ego_obj_region_obj_mask, dim=0),
         "exo_obj_region": torch.cat(exo_obj_region, dim=0),
         "crop_weights": torch.cat(crop_weights, dim=0),
         "exo_obj_region_obj_mask": torch.cat(exo_obj_region_obj_mask, dim=0)

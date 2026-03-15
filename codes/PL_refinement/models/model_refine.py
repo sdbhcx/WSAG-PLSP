@@ -38,7 +38,7 @@ class ModelAGDsup(nn.Module):
         self.num_patches = self.encoder.num_patches
         self.patch_size = patch_size
         
-    def forward(self, imgs, text_feat, ):
+    def forward(self, imgs, text_feat, exo_img):
         _, x = self.encoder(imgs)
         
         v = text_feat.float().unsqueeze(1)
@@ -46,5 +46,6 @@ class ModelAGDsup(nn.Module):
         
         pred_heatmap = self.pred_decoder(x, aff_token)
         
-        return pred_heatmap
+        _, exo_feat = self.encoder(exo_img)
+        return pred_heatmap, exo_feat
     
