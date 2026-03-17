@@ -205,20 +205,28 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             else:
                 exo_boxes, exo_scores = self.exo_obj_dict[verb][noun][exo_p.split('/')[-1]]
                 exo_box = exo_boxes[exo_box_id]
+            # 将外部视角的目标边界框转换为掩码
             exo_objbox_mask = self.box2mask(exo_box, pad_w_exo, pad_h_exo, exo_shape_padded) # padded img 256
+            # 加载外部视角的完整目标掩码
             exo_whole_obj_mask_noresize = torch.tensor(np.array(Image.open(
                 exo_p.replace("exocentric", self.obj_mask_dir_name).replace(".jpg", "_pl.png")
             ))).float() / 255. 
+            # 对完整目标掩码进行方形填充
             exo_whole_obj_mask_noresize_padded, _, _ = pad_to_square(exo_whole_obj_mask_noresize.unsqueeze(0))
-            
+            # 计算填充后的外部视角目标边界框
             exo_obj_box_noresize = exo_box + np.array([pad_w_exo, pad_h_exo, pad_w_exo, pad_h_exo]) # padded img ori
             l, t, r, b = [int(x) for x in exo_obj_box_noresize]
+            # 裁剪外部视角图像的目标区域
             exo_obj_region_noresize = exo_img_noresize_padded[:, t:b, l:r] # cropped padded img ori
+            # 裁剪外部视角目标掩码的目标区域
             exo_obj_region_obj_mask_noresize = exo_whole_obj_mask_noresize_padded[:, t:b, l:r] # cropped padded img ori
+            # 对裁剪后的目标区域图像进行方形填充，确保目标区域图像是正方形
             exo_obj_region_noresize_padded, _, _ = pad_to_square(exo_obj_region_noresize) # cropped padded img ori, padded again
             exo_obj_region_obj_mask_noresize_padded, _, _ = pad_to_square(exo_obj_region_obj_mask_noresize) # cropped padded img ori, padded again
+            # 提供目标区域的图像信息
             exo_obj_region = F.interpolate(
                 exo_obj_region_noresize_padded.unsqueeze(0), size=self.img_size, mode="bilinear").squeeze(0) # cropped padded img ori, padded again 224
+            # 外部视角目标区域的掩码数据，标记目标的精确位置和形状
             exo_obj_region_obj_mask = F.interpolate(
                 exo_obj_region_obj_mask_noresize_padded.unsqueeze(0), size=self.img_size, mode="bilinear").squeeze(0) # cropped padded img ori, padded again 224
             

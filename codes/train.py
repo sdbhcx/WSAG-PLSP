@@ -203,6 +203,7 @@ def main(config, seed):
         all_cls_loss = 0.0
         all_noun_sim_loss = 0.
         all_part_sim_loss = 0.
+        all_proto_loss = 0.
         all_num = 0
         acc_num = 0
         logger.info(f"============Training Epoch {epoch}============")
@@ -213,15 +214,43 @@ def main(config, seed):
                 continue # may cause cuda Bug
             
             if config["num_exo"] > 0:
-                aff_res, sim_loss, exo_cls_res, pred_noun, pred_part = model(
+                # Prepare masks for prototype contrast loss
+                ego_part_mask = batch_data["gt_mask"].cuda()  # [B, 1, H, W]
+                ego_obj_mask = batch_data["gt_mask"].cuda()  # Use GT mask as object mask for now
+                exo_obj_mask_full = batch_data["exo_objbox_mask_patch"].cuda()  # [B*num_exo, 196, 1]
+                
+                # Resize masks to match feature dimensions
+                ego_part_mask_resized = F.interpolate(
+                    ego_part_mask, 
+                    size=(14, 14),  # Match patch grid size
+                    mode='nearest'
+                ).squeeze(1)  # [B, 14, 14]
+                ego_obj_mask_resized = F.interpolate(
+                    ego_obj_mask, 
+                    size=(14, 14),
+                    mode='nearest'
+                ).squeeze(1)  # [B, 14, 14]
+                
+                # Flatten masks to [B, 196]
+                ego_part_mask_flat = ego_part_mask_resized.reshape(ego_part_mask_resized.shape[0], -1)
+                ego_obj_mask_flat = ego_obj_mask_resized.reshape(ego_obj_mask_resized.shape[0], -1)
+                
+                # Exo mask is already [B*num_exo, 196, 1], just squeeze
+                exo_obj_mask_full_flat = exo_obj_mask_full.squeeze(-1)  # [B*num_exo, 196]
+                
+                aff_res, sim_loss, exo_cls_res, pred_noun, pred_part, proto_loss = model(
                     batch_data["input_image"], batch_data["sent_feats"], 
                     batch_data["exo_image"], 
                     batch_data["exo_objbox_mask_patch"], config["num_exo"],
+                    ego_part_mask=ego_part_mask_flat,
+                    ego_obj_mask=ego_obj_mask_flat,
+                    exo_obj_mask_full=exo_obj_mask_full_flat
                 )
             else:
                 aff_res, pred_noun, pred_part = model(
                     batch_data["input_image"], batch_data["sent_feats"], 
                 )
+                proto_loss = torch.zeros(1,).cuda()
             
             noun_sim_loss = (1 - F.cosine_similarity(pred_noun, batch_data["noun_feats"].cuda(), dim=2)).mean()
             part_sim_loss = (1 - F.cosine_similarity(pred_part, batch_data["part_feats"].cuda(), dim=2)).mean()
@@ -247,11 +276,18 @@ def main(config, seed):
             r_prob = F.softmax(r_pred.reshape(len(r_pred), -1), dim=1)
             gt_prob = batch_data["gt_mask_prob"].reshape(len(r_pred), -1)
             
+            # Handle proto_loss - may be None if masks are not available
+            if proto_loss is not None:
+                proto_loss = proto_loss.mean()
+            else:
+                proto_loss = torch.zeros(1,).cuda()
+            
             cur_loss = loss_config["kl_loss_coeff"] * kl_loss + \
                 loss_config["sim_loss_coeff"] * sim_loss + \
                     loss_config["exo_cls_coeff"] * exo_cls_loss + \
                         loss_config["noun_sim_coeff"] * noun_sim_loss + \
-                            loss_config["part_sim_coeff"] * part_sim_loss
+                            loss_config["part_sim_coeff"] * part_sim_loss + \
+                                loss_config.get("proto_loss_coeff", 0.1) * proto_loss
             all_num += 1
             all_loss += cur_loss.detach().item()
             all_kl_loss += kl_loss.detach().item()
@@ -259,6 +295,7 @@ def main(config, seed):
             all_cls_loss += exo_cls_loss.detach().item()
             all_noun_sim_loss += noun_sim_loss.detach().item()
             all_part_sim_loss += part_sim_loss.detach().item()
+            all_proto_loss += proto_loss.detach().item()
             
             cur_loss /= accum_iter
             cur_loss.backward()
@@ -276,7 +313,7 @@ def main(config, seed):
             lr_scheduler.step()
         logger.info(
             f"Training loss: {all_loss / all_num}, KL loss: {all_kl_loss / all_num}, Sim loss: {all_sim_loss / all_num}, Exo CLS loss: {all_cls_loss / all_num}, \n"
-            f"Noun sim loss: {all_noun_sim_loss / all_num}, Part sim loss: {all_part_sim_loss / all_num}")
+            f"Noun sim loss: {all_noun_sim_loss / all_num}, Part sim loss: {all_part_sim_loss / all_num}, Proto loss: {all_proto_loss / all_num}")
         logger.info(
             f"learning rate:{optimizer.state_dict()['param_groups'][0]['lr']}\n")
         

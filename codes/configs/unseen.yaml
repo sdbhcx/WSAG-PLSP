@@ -54,3 +54,4 @@ loss:
   exo_cls_coeff: 10.
   noun_sim_coeff: 1.
   part_sim_coeff: 0.1
+  proto_loss_coeff: 0.1
