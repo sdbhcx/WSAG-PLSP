@@ -192,9 +192,17 @@ class ModelAGDsup(nn.Module):
         anchor_prototype = masked_avg_pooling(ego_features[:, 1:], ego_part_mask_flat)  # [B, D]
         
         # 背景原型：使用背景区域 (1 - obj_mask)
-        ego_obj_mask_flat = ego_obj_mask.reshape(B, -1)  # [B, N]
-        ego_bg_mask = 1.0 - ego_obj_mask_flat
+        # 这里的 ego_obj_mask 实际上应该是 whole_object_mask
+        ego_whole_obj_mask_flat = ego_obj_mask.reshape(B, -1)  # [B, N]
+        ego_bg_mask = 1.0 - ego_whole_obj_mask_flat
         ego_bg_prototype = masked_avg_pooling(ego_features[:, 1:], ego_bg_mask)  # [B, D]
+        
+        # 难负样本原型：物体其余部分 (Whole Object - Part)
+        # 注意：需要确保相减后不为负数，且有足够的像素
+        ego_body_mask = (ego_whole_obj_mask_flat - ego_part_mask_flat).clamp(min=0)
+        # 为防止 ego_body_mask 全为0（即只有部件没有其他部分），可以加一个极小的数值或者只在mask非空时使用
+        # 这里 masked_avg_pooling 内部有 clamp(min=1e-6) 防止除零
+        ego_body_prototype = masked_avg_pooling(ego_features[:, 1:], ego_body_mask)
         
         # 2. 构建第三人称图像的原型
         # 正原型：使用物体掩码进行掩码平均池化
@@ -202,17 +210,18 @@ class ModelAGDsup(nn.Module):
         exo_pos_prototype = masked_avg_pooling(exo_features[:, 1:], exo_obj_mask_flat)  # [B*num_exo, D]
         
         # 背景原型：使用背景区域
-        exo_bg_mask = 1.0 - exo_obj_mask_flat
-        exo_bg_prototype = masked_avg_pooling(exo_features[:, 1:], exo_bg_mask)  # [B*num_exo, D]
+        # exo_bg_mask = 1.0 - exo_obj_mask_flat
+        # exo_bg_prototype = masked_avg_pooling(exo_features[:, 1:], exo_bg_mask)  # [B*num_exo, D]
         
         # 3. 构建批次内的正负原型集合
         # 正原型集合：所有样本的exo正原型
         positives = [exo_pos_prototype]  # [B*num_exo, D]
         
-        # 负原型集合：背景原型
+        # 负原型集合：背景原型 + 难负样本原型
         negatives = [
-            ego_bg_prototype.unsqueeze(1).expand(-1, num_exo, -1).reshape(B*num_exo, D),  # [B*num_exo, D]
-            exo_bg_prototype  # [B*num_exo, D]
+            ego_bg_prototype.unsqueeze(1).expand(-1, num_exo, -1).reshape(B*num_exo, D),  # [B*num_exo, D] (Easy Negative: Background)
+            # exo_bg_prototype,  # [B*num_exo, D] (第三人称背景也可以作为负样本，可选)
+            ego_body_prototype.unsqueeze(1).expand(-1, num_exo, -1).reshape(B*num_exo, D) # [B*num_exo, D] (Hard Negative: Object Body)
         ]
         
         # 扩展锚点以匹配批次大小

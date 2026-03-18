@@ -153,6 +153,8 @@ class DatasetAGD_train(torch.utils.data.Dataset):
         ego_boxes, ego_scores = self.ego_obj_dict[verb][noun][input_p.split('/')[-1]]
         ego_box_id = np.random.randint(0, len(ego_boxes))
         ego_box = ego_boxes[ego_box_id]
+        
+        ego_objbox_mask = self.box2mask(ego_box, input_shape, L=256)
 
         all_exo_imgs = []
         all_exo_objbox_masks = []
@@ -221,12 +223,13 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             size=256,
             mode="bilinear",
         ).squeeze(0)
-        input_img, gt, rand_crop_origin = self.crop(input_img, gt, )
+        input_img, gt, ego_objbox_mask, rand_crop_origin = self.crop(input_img, gt, ego_objbox_mask)
 
             
         if np.random.rand() < 0.5:
             input_img = torch.flip(input_img, dims=[2])
             gt = torch.flip(gt, dims=[2])
+            ego_objbox_mask = torch.flip(ego_objbox_mask, dims=[2])
             
         exo_objbox_mask_patch = all_exo_objbox_masks.resize(self.num_exo, 14, 16, 14, 16).permute(0, 1, 3, 2, 4).reshape(self.num_exo, 14, 14, 256).mean(dim=-1)
         exo_objbox_mask_patch = (exo_objbox_mask_patch > 0).float().reshape(self.num_exo, 1, 196) # need this?
@@ -256,38 +259,44 @@ class DatasetAGD_train(torch.utils.data.Dataset):
                     neg_imgs.append(neg_img)
                 input_img1 = F.interpolate(input_img.unsqueeze(0), size=self.img_size//2, mode="bilinear")[0]
                 gt_mask1 = F.interpolate(gt_mask.unsqueeze(0), size=self.img_size//2, mode="bilinear")[0]
+                ego_objbox_mask1 = F.interpolate(ego_objbox_mask.unsqueeze(0), size=self.img_size//2, mode="bilinear")[0]
                 rand_aug_id = np.random.randint(0, 4)
                 input_img = torch.zeros_like(input_img)
                 gt_mask = torch.zeros_like(gt_mask)
+                ego_objbox_mask = torch.zeros_like(ego_objbox_mask)
                 seq_len = (self.img_size//16)**2
                 if rand_aug_id == 0:
                     input_img[:, :self.img_size//2, :self.img_size//2] = input_img1
                     gt_mask[:, :self.img_size//2, :self.img_size//2] = gt_mask1
+                    ego_objbox_mask[:, :self.img_size//2, :self.img_size//2] = ego_objbox_mask1
                     input_img[:, :self.img_size//2, self.img_size//2:] = neg_imgs[0]
                     input_img[:, self.img_size//2:, :self.img_size//2] = neg_imgs[1]
                     input_img[:, self.img_size//2:, self.img_size//2:] = neg_imgs[2]
                 elif rand_aug_id == 1:
                     input_img[:, :self.img_size//2, self.img_size//2:] = input_img1
                     gt_mask[:, :self.img_size//2, self.img_size//2:] = gt_mask1
+                    ego_objbox_mask[:, :self.img_size//2, self.img_size//2:] = ego_objbox_mask1
                     input_img[:, :self.img_size//2, :self.img_size//2] = neg_imgs[0]
                     input_img[:, self.img_size//2:, :self.img_size//2] = neg_imgs[1]
                     input_img[:, self.img_size//2:, self.img_size//2:] = neg_imgs[2]
                 elif rand_aug_id == 2:
                     input_img[:, self.img_size//2:, :self.img_size//2] = input_img1
                     gt_mask[:, self.img_size//2:, :self.img_size//2] = gt_mask1
+                    ego_objbox_mask[:, self.img_size//2:, :self.img_size//2] = ego_objbox_mask1
                     input_img[:, :self.img_size//2, self.img_size//2:] = neg_imgs[0]
                     input_img[:, :self.img_size//2, :self.img_size//2] = neg_imgs[1]
                     input_img[:, self.img_size//2:, self.img_size//2:] = neg_imgs[2]
                 elif rand_aug_id == 3:
                     input_img[:, self.img_size//2:, self.img_size//2:] = input_img1
                     gt_mask[:, self.img_size//2:, self.img_size//2:] = gt_mask1
+                    ego_objbox_mask[:, self.img_size//2:, self.img_size//2:] = ego_objbox_mask1
                     input_img[:, :self.img_size//2, self.img_size//2:] = neg_imgs[0]
                     input_img[:, self.img_size//2:, :self.img_size//2] = neg_imgs[1]
                     input_img[:, :self.img_size//2, :self.img_size//2] = neg_imgs[2]
                 gt_mask_prob = gt_mask / gt_mask.sum()
         
         return input_img, all_exo_imgs, gt_mask, gt_mask_prob, input_shape, sent_feat, noun_feat, part_feat, \
-            verb, noun, exo_objbox_mask_patch, input_p, vid, nid
+            verb, noun, exo_objbox_mask_patch, input_p, vid, nid, ego_objbox_mask
 
     
     def get_input_image_back(self, x):
@@ -322,12 +331,13 @@ def get_loader(batch_size, data_dir, img_size, split_file, exo_obj_file, ego_obj
 def collate_fn_train(batch):
     input_imgs, exo_imgs, pseudo_gt_masks, pseudo_gt_masks_prob, input_shapes, \
         sent_feats, noun_feats, part_feats, verbs, nouns, exo_objbox_masks_patch, \
-            input_ps, vids, nids, = list(zip(*batch))
+            input_ps, vids, nids, ego_objbox_masks = list(zip(*batch))
     input_imgs = torch.stack(input_imgs, dim=0) # B 3 H W
     exo_imgs = torch.cat(exo_imgs, dim=0) # B*N 3 H W
     pseudo_gt_masks =  torch.stack(pseudo_gt_masks, dim=0) # B 1 H W
     pseudo_gt_masks_prob =  torch.stack(pseudo_gt_masks_prob, dim=0) # B 1 H W
     exo_objbox_masks_patch = torch.cat(exo_objbox_masks_patch, dim=0)
+    ego_objbox_masks =  torch.stack(ego_objbox_masks, dim=0) 
     B = input_imgs.shape[0]
     N_E = exo_imgs.shape[0] // B
     return {
@@ -346,6 +356,7 @@ def collate_fn_train(batch):
         "input_paths": input_ps,
         "vids": torch.tensor(vids),
         "nids": torch.tensor(nids),
+        "ego_objbox_mask": ego_objbox_masks,
     }
 
 

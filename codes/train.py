@@ -216,7 +216,7 @@ def main(config, seed):
             if config["num_exo"] > 0:
                 # Prepare masks for prototype contrast loss
                 ego_part_mask = batch_data["gt_mask"].cuda()  # [B, 1, H, W]
-                ego_obj_mask = batch_data["gt_mask"].cuda()  # Use GT mask as object mask for now
+                ego_obj_mask = batch_data["ego_objbox_mask"].cuda()  # Whole object mask from box
                 exo_obj_mask_full = batch_data["exo_objbox_mask_patch"].cuda()  # [B*num_exo, 196, 1]
                 
                 # Resize masks to match feature dimensions
