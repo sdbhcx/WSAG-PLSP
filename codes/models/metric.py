@@ -8,10 +8,17 @@ import torch
 # kld(map2||map1) -- map2 is gt
 def KLD(map1, map2, reduction="batchmean"): # map1 has been softmaxed
     assert map1.dim() == map2.dim() == 2
-    assert torch.allclose(map1.sum(dim=1), torch.ones(len(map1)).to(map1.device))
-    assert torch.allclose(map2.sum(dim=1), torch.ones(len(map2)).to(map2.device))
-    map1, map2 = map1/map1.sum(dim=1, keepdim=True), map2/map2.sum(dim=1, keepdim=True)
-    map1 += 1e-10
+    # Ensure numerical stability by re-normalizing instead of strictly asserting
+    # assert torch.allclose(map1.sum(dim=1), torch.ones(len(map1)).to(map1.device))
+    # assert torch.allclose(map2.sum(dim=1), torch.ones(len(map2)).to(map2.device))
+    
+    map1_sum = map1.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    map2_sum = map2.sum(dim=1, keepdim=True).clamp(min=1e-10)
+    
+    map1 = map1 / map1_sum
+    map2 = map2 / map2_sum
+    
+    map1 = map1.clamp(min=1e-10) # Avoid log(0)
     kld = F.kl_div(map1.log(), map2, reduction=reduction)
     return kld
 

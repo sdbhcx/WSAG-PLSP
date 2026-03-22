@@ -38,24 +38,43 @@ def selective_prototype_contrast_loss(anchor, positives, negatives, temperature=
     """
     B, D = anchor.shape
     
+    # Normalize features for stability and cosine similarity
+    anchor = F.normalize(anchor, p=2, dim=1)
+    positives = [F.normalize(p, p=2, dim=1) for p in positives]
+    negatives = [F.normalize(n, p=2, dim=1) for n in negatives]
+    
     # Combine all prototypes
-    all_prototypes = torch.cat([anchor.unsqueeze(1)] + positives + negatives, dim=1)  # [B, 1+P+N, D]
+    # positives and negatives are lists of [B, D] tensors
+    # Convert them to [B, 1, D] for concatenation
+    positives_expanded = [p.unsqueeze(1) for p in positives]
+    negatives_expanded = [n.unsqueeze(1) for n in negatives]
+    
+    # All prototypes: Anchor (0) + Positives (1..P) + Negatives (P+1..end)
+    all_prototypes = torch.cat([anchor.unsqueeze(1)] + positives_expanded + negatives_expanded, dim=1)  # [B, 1+P+N, D]
     
     # Compute similarity scores
     anchor_expanded = anchor.unsqueeze(1)  # [B, 1, D]
-    similarities = torch.matmul(anchor_expanded, all_prototypes.transpose(1, 2))  # [B, 1, 1+P+N]
-    similarities = similarities.squeeze(1) / temperature  # [B, 1+P+N]
     
-    # Compute loss: -log(exp(sim_pos) / sum(exp(sim_all)))
-    # Positive prototypes are at indices 1 to 1+len(positives)
+    # [B, 1, D] @ [B, D, 1+P+N] -> [B, 1, 1+P+N]
+    logits = torch.matmul(anchor_expanded, all_prototypes.transpose(1, 2)).squeeze(1)  # [B, 1+P+N]
+    
+    # Scale by temperature
+    logits = logits / temperature
+    
+    # Identify indices
     num_positives = len(positives)
-    pos_similarities = similarities[:, 1:1+num_positives]  # [B, P]
     
-    # Sum over positive prototypes
-    pos_exp = torch.exp(pos_similarities).sum(dim=1)  # [B]
-    all_exp = torch.exp(similarities).sum(dim=1)  # [B]
+    # Positives are at indices 1 to 1+num_positives (index 0 is anchor itself)
+    pos_logits = logits[:, 1:1+num_positives]
     
-    loss = -torch.log(pos_exp / all_exp).mean()
+    # Use LogSumExp for numerical stability
+    # Loss = -log( sum(exp(pos)) / sum(exp(all)) )
+    #      = -( logsumexp(pos) - logsumexp(all) )
+    
+    log_prob_pos = torch.logsumexp(pos_logits, dim=1)
+    log_prob_all = torch.logsumexp(logits, dim=1)
+    
+    loss = -(log_prob_pos - log_prob_all).mean()
     
     return loss
 
