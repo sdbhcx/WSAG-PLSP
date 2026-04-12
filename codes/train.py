@@ -3,6 +3,8 @@ import os
 main_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(main_dir)
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 指定你要使用的 GPU 编号
+
 import argparse
 import yaml
 import torch
@@ -47,6 +49,76 @@ def load_config(config_path):
     with open(config_path, 'r') as stream:
         config = yaml.safe_load(stream)
     return config
+
+
+def get_epoch_loss_config(base_loss_config, loss_schedule, epoch):
+    if not loss_schedule:
+        return base_loss_config
+    effective = dict(base_loss_config)
+    for stage in loss_schedule:
+        start_epoch = stage.get("start_epoch", 0)
+        end_epoch = stage.get("end_epoch", 10**9)
+        if start_epoch <= epoch <= end_epoch:
+            for key, value in stage.items():
+                if key in ("start_epoch", "end_epoch"):
+                    continue
+                effective[key] = value
+            break
+    return effective
+
+
+def batch_get_centers(pred_norm):
+    B, H, W = pred_norm.shape
+    device = pred_norm.device
+    y = torch.arange(H, dtype=torch.float32, device=device) / H
+    x = torch.arange(W, dtype=torch.float32, device=device) / W
+    y_grid, x_grid = torch.meshgrid(y, x, indexing='ij')
+    
+    centers = []
+    for b in range(B):
+        part_map = pred_norm[b] + 1e-3
+        part_map_pdf = part_map / part_map.sum()
+        y_c = (part_map_pdf * y_grid).sum()
+        x_c = (part_map_pdf * x_grid).sum()
+        centers.append([x_c, y_c])
+    return centers
+
+
+def get_variance(part_map_pdf, x_c, y_c):
+    H, W = part_map_pdf.shape
+    device = part_map_pdf.device
+    y = torch.arange(H, dtype=torch.float32, device=device) / H
+    x = torch.arange(W, dtype=torch.float32, device=device) / W
+    y_grid, x_grid = torch.meshgrid(y, x, indexing='ij')
+    
+    v_y = (part_map_pdf * ((y_grid - y_c) ** 2)).sum()
+    v_x = (part_map_pdf * ((x_grid - x_c) ** 2)).sum()
+    return v_x, v_y
+
+
+def concentration_loss(pred):
+    # b x h x w
+    B, H, W = pred.shape
+    tmp_max, tmp_min = pred.max(-1)[0].max(-1)[0].view(B, 1, 1), \
+                       pred.min(-1)[0].min(-1)[0].view(B, 1, 1)
+
+    pred_norm = ((pred - tmp_min) / (tmp_max - tmp_min + 1e-10))  # b x 28 x 28
+
+    loss = 0
+    epsilon = 1e-3
+    centers_all = batch_get_centers(pred_norm)
+    for b in range(B):
+        centers = centers_all[b]
+        # normalize part map as spatial pdf
+        part_map = pred_norm[b, :, :] + epsilon  # prevent gradient explosion
+        k = part_map.sum()
+        part_map_pdf = part_map / k
+        x_c, y_c = centers
+        v_x, v_y = get_variance(part_map_pdf, x_c, y_c)
+        loss_per_part = (v_x + v_y)
+        loss = loss_per_part + loss
+    loss = loss / B
+    return loss
 
 
 def main(config, seed):
@@ -160,12 +232,15 @@ def main(config, seed):
     wd = optimizer_config["wd"]
     optimizer = optim.AdamW(params=all_params, lr=lr, betas=betas, weight_decay=wd)
 
-    if optimizer_config["sche_type"] == "step":
+    sche_type = optimizer_config["sche_type"]
+    if sche_type == "step":
         lr_scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=optimizer_config["lr_step"], gamma=optimizer_config["lr_gamma"])
-    elif optimizer_config["sche_type"] == "cos":
+    elif sche_type in ("cos", "cosine"):
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=optimizer_config["max_iter"], eta_min=1e-6)
+    else:
+        raise ValueError(f"Unsupported sche_type: {sche_type}")
 
     logger.debug("Model:")
     logger.debug(model)
@@ -179,9 +254,15 @@ def main(config, seed):
     
     model = torch.nn.DataParallel(model).cuda()
     loss_config = config["loss"]
+    loss_schedule = config.get("loss_schedule", [])
     total_iter = 0
     best_kld = 10000.
     best_sim = -10000.
+    early_stop_cfg = config.get("early_stop", {})
+    early_stop_enabled = early_stop_cfg.get("enabled", False)
+    early_stop_patience = early_stop_cfg.get("patience", 8)
+    early_stop_min_delta = early_stop_cfg.get("min_delta", 0.0)
+    no_improve_epochs = 0
     
     frozen_feature = CLIP()
     state_dict = torch.jit.load(encoder_ckpt, map_location='cpu').float().state_dict()
@@ -196,6 +277,17 @@ def main(config, seed):
     for epoch in range(num_epochs):
         if total_iter >= optimizer_config["max_iter"]:
             break
+        cur_loss_config = get_epoch_loss_config(loss_config, loss_schedule, epoch)
+        if loss_schedule:
+            logger.info(
+                f"Epoch {epoch} loss coeffs: "
+                f"kl={cur_loss_config.get('kl_loss_coeff')}, "
+                f"sim={cur_loss_config.get('sim_loss_coeff')}, "
+                f"exo_cls={cur_loss_config.get('exo_cls_coeff')}, "
+                f"noun={cur_loss_config.get('noun_sim_coeff')}, "
+                f"part={cur_loss_config.get('part_sim_coeff')}, "
+                f"proto={cur_loss_config.get('proto_loss_coeff')}, "
+                f"conc={cur_loss_config.get('conc_loss_coeff')}")
         model.train()
         all_loss = 0.0
         all_kl_loss = 0.
@@ -204,6 +296,8 @@ def main(config, seed):
         all_noun_sim_loss = 0.
         all_part_sim_loss = 0.
         all_proto_loss = 0.
+        all_conc_loss = 0.
+
         all_num = 0
         acc_num = 0
         logger.info(f"============Training Epoch {epoch}============")
@@ -282,12 +376,15 @@ def main(config, seed):
             else:
                 proto_loss = torch.zeros(1,).cuda()
             
-            cur_loss = loss_config["kl_loss_coeff"] * kl_loss + \
-                loss_config["sim_loss_coeff"] * sim_loss + \
-                    loss_config["exo_cls_coeff"] * exo_cls_loss + \
-                        loss_config["noun_sim_coeff"] * noun_sim_loss + \
-                            loss_config["part_sim_coeff"] * part_sim_loss + \
-                                loss_config.get("proto_loss_coeff", 0.1) * proto_loss
+            conc_loss = concentration_loss(r_pred.squeeze(1))
+
+            cur_loss = cur_loss_config["kl_loss_coeff"] * kl_loss + \
+                cur_loss_config["sim_loss_coeff"] * sim_loss + \
+                    cur_loss_config["exo_cls_coeff"] * exo_cls_loss + \
+                        cur_loss_config["noun_sim_coeff"] * noun_sim_loss + \
+                            cur_loss_config["part_sim_coeff"] * part_sim_loss + \
+                            cur_loss_config.get("proto_loss_coeff", 0.1) * proto_loss + \
+                                cur_loss_config.get("conc_loss_coeff", 0.01) * conc_loss
             all_num += 1
             all_loss += cur_loss.detach().item()
             all_kl_loss += kl_loss.detach().item()
@@ -296,6 +393,7 @@ def main(config, seed):
             all_noun_sim_loss += noun_sim_loss.detach().item()
             all_part_sim_loss += part_sim_loss.detach().item()
             all_proto_loss += proto_loss.detach().item()
+            all_conc_loss += conc_loss.detach().item()
             
             cur_loss /= accum_iter
             cur_loss.backward()
@@ -304,16 +402,16 @@ def main(config, seed):
                 optimizer.step()
                 optimizer.zero_grad()
                 acc_num += 1
-                if optimizer_config["sche_type"] == "cos":
+                if sche_type in ("cos", "cosine"):
                     lr_scheduler.step()
                 total_iter += 1
             
             
-        if optimizer_config["sche_type"] == "step":
+        if sche_type == "step":
             lr_scheduler.step()
         logger.info(
             f"Training loss: {all_loss / all_num}, KL loss: {all_kl_loss / all_num}, Sim loss: {all_sim_loss / all_num}, Exo CLS loss: {all_cls_loss / all_num}, \n"
-            f"Noun sim loss: {all_noun_sim_loss / all_num}, Part sim loss: {all_part_sim_loss / all_num}, Proto loss: {all_proto_loss / all_num}")
+            f"Noun sim loss: {all_noun_sim_loss / all_num}, Part sim loss: {all_part_sim_loss / all_num}, Proto loss: {all_proto_loss / all_num}, Conc loss: {all_conc_loss / all_num}")
         logger.info(
             f"learning rate:{optimizer.state_dict()['param_groups'][0]['lr']}\n")
         
@@ -361,11 +459,25 @@ def main(config, seed):
             f"\nnoun sim: {vall_noun_sim/vall_num}, part sim: {vall_part_sim/vall_num}")
         
         
-        if vall_kld/vall_num_sum < best_kld:
-            best_kld = vall_kld/vall_num_sum
+        cur_kld = vall_kld / vall_num_sum
+        cur_sim = vall_sim / vall_num_sum
+        cur_nss = vall_nss / vall_num_sum
+        if cur_kld < best_kld - early_stop_min_delta:
+            best_kld = cur_kld
+            no_improve_epochs = 0
             torch.save({'optimizer': optimizer.state_dict(),
                         'state_dict': model.module.state_dict()}, os.path.join(config['work_dir'], "ckpt", f'bestKLD.ckpt'))
-            logger.info(f"New best KLD: {vall_kld/vall_num_sum}, {vall_sim/vall_num_sum}, {vall_nss/vall_num_sum}")
+            logger.info(f"New best KLD: {cur_kld}, {cur_sim}, {cur_nss}")
+        else:
+            no_improve_epochs += 1
+            logger.info(
+                f"No KLD improvement for {no_improve_epochs} epoch(s). "
+                f"Best KLD: {best_kld}, Current KLD: {cur_kld}")
+            if early_stop_enabled and no_improve_epochs >= early_stop_patience:
+                logger.info(
+                    f"Early stopping triggered at epoch {epoch}. "
+                    f"Best KLD: {best_kld}, patience: {early_stop_patience}, min_delta: {early_stop_min_delta}")
+                break
         # if vall_sim/vall_num_sum > best_sim:
         #     best_sim = vall_sim/vall_num_sum
         #     torch.save({'optimizer': optimizer.state_dict(),

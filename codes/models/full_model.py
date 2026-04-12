@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from models.encoder_clip import VisionTransformer
 from models.decoder_affordance import Affordance_Decoder
 from models.SAM_decoder import SAM_Decoder_Simple
+from models.SAM_FPN import SAM_Decoder_FPN
 
 
 def masked_avg_pooling(features, mask):
@@ -21,7 +22,6 @@ def masked_avg_pooling(features, mask):
     mask_sum = mask.sum(dim=1, keepdim=True).clamp(min=1e-6)
     pooled = (features * mask.unsqueeze(-1)).sum(dim=1) / mask_sum
     return pooled
-
 
 def selective_prototype_contrast_loss(anchor, positives, negatives, temperature=0.07):
     """
@@ -109,11 +109,24 @@ class ModelAGDsup(nn.Module):
             norm_layer=norm_layer, init_values=decoder_layer_scale_init_value, init_std=init_std
         )
         
-        self.pred_decoder = SAM_Decoder_Simple(
-            transformer_dim=decoder_embed_dim,
-            activation=nn.GELU,
-            **pred_decoder_args,
-        )
+        if pred_model_type == "SAM":
+            self.pred_decoder = SAM_Decoder_Simple(
+                transformer_dim=decoder_embed_dim,
+                activation=nn.GELU,
+                **pred_decoder_args,
+            )
+        elif pred_model_type == "SAM_FPN":
+            self.pred_decoder = SAM_Decoder_FPN(
+                transformer_dim=decoder_embed_dim,
+                activation=nn.GELU,
+                **pred_decoder_args,
+            )
+        else:
+            self.pred_decoder = SAM_Decoder_FPN(
+                transformer_dim=decoder_embed_dim,
+                activation=nn.GELU,
+                **pred_decoder_args,
+            )
           
         self.num_patches = self.encoder.num_patches
         self.patch_size = patch_size
@@ -136,11 +149,11 @@ class ModelAGDsup(nn.Module):
             nn.Linear(512, 512)
         )
         
-        self.proto_projector = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.GELU(),
-            nn.Linear(512, 512)
-        )
+        # self.proto_projector = nn.Sequential(
+        #     nn.Linear(512, 512),
+        #     nn.GELU(),
+        #     nn.Linear(512, 512)
+        # )
         
         
     def forward(self, imgs, text_feat, exo=None, exo_obj_mask=None, num_exo=1, 
@@ -148,7 +161,7 @@ class ModelAGDsup(nn.Module):
         # 1. 提取第一视角图像特征
         _, x = self.encoder(imgs)
 
-        proj_x = self.proto_projector(x)
+        # proj_x = self.proto_projector(x)
         # 2. 处理动作语义特征
         v = text_feat.float().unsqueeze(1)
         # 3. 预测物体特征
@@ -165,7 +178,7 @@ class ModelAGDsup(nn.Module):
         if exo is not None:
             # with torch.no_grad():
             _, exo = self.encoder(exo)
-            proj_exo = self.proto_projector(exo)
+            # proj_exo = self.proto_projector(exo)
 
             exo_token = (exo[:, 1:] * exo_obj_mask).sum(dim=1)
             D = aff_token.shape[-1]
@@ -177,7 +190,7 @@ class ModelAGDsup(nn.Module):
             # 构建选择性原型对比损失
             if ego_part_mask is not None and exo_obj_mask_full is not None:
                 proto_loss = self.compute_prototype_contrast_loss(
-                    proj_x, proj_exo, ego_part_mask, ego_obj_mask, 
+                    x, exo, ego_part_mask, ego_obj_mask, 
                     exo_obj_mask_full, num_exo
                 )
             
