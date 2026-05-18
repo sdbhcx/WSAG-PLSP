@@ -1,33 +1,39 @@
-work_dir: &work_dir logs/unseen
+work_dir: &work_dir logs/seen_stage
 deterministic: False
 
-data_dir: /path/to/AGD20K
+data_dir: /mnt/sdb/wyn/data/AGD20K
 
 load:
-  encoder_ckpt: /path/to/ViT-B-16.pt
+  encoder_ckpt: /mnt/sdb/wyn/model/ViT-B-16.pt
   all_ckpt: # leave blank for training
 
 batch_size: 10 # real batch size = batch_size * accum_iter
 img_size: 224
-split_type: Unseen
+split_type: Seen
 num_exo: 1
 PL_mode: refined
 aug4imgRatio: 0.5
 
 optimizer:
-  lr: 0.0001
+  lr: 0.00005
   lr_encoder_coeff: 0.1
   betas:
     - 0.9
     - 0.95
   wd: 0.01
 
-  max_iter: 5000000
-  lr_step:  5000000
+  max_iter: 14000
+  lr_step: 14000
   lr_gamma: 0.1
   num_epochs: 40
   accum_iter: 2
-  sche_type: step
+  sche_type: cos
+
+early_stop:
+  enabled: True
+  metric: kld
+  patience: 8
+  min_delta: 0.001
 
 model:
   encoder_type: CLIP
@@ -54,9 +60,22 @@ model:
   margin: 0.1
 
 loss:
-  kl_loss_coeff: 1.0
-  sim_loss_coeff: 10.
-  exo_cls_coeff: 10.
-  noun_sim_coeff: 1.
-  part_sim_coeff: 0.1
-  proto_loss_coeff: 0.1
+  kl_loss_coeff: 0.3
+  sim_loss_coeff: 1.
+  exo_cls_coeff: 0.6
+  noun_sim_coeff: 0.1
+  part_sim_coeff: 0.01
+  proto_loss_coeff: 0.2
+  conc_loss_coeff: 0.05
+
+loss_schedule:
+  - start_epoch: 0
+    end_epoch: 11
+    kl_loss_coeff: 0.3
+    exo_cls_coeff: 0.6
+    proto_loss_coeff: 0.1
+  - start_epoch: 12
+    end_epoch: 1000
+    kl_loss_coeff: 0.3
+    exo_cls_coeff: 0.6
+    proto_loss_coeff: 0.15

@@ -356,26 +356,29 @@ def main(config, seed):
             cur_loss = loss_config["CLIP_align_coeff"] * CLIP_align_loss
             
             # --- Pixel Contrastive Loss ---
+            # Define positive/negative pixels from model prediction and ego object mask.
             thresh_pos = loss_config.get("pix_contrast_thresh", 0.5)
-            # pred_mask_bin_crop is [B, 1, 14, 14]
-            B_pos = (pred_mask_bin_crop > thresh_pos).float().squeeze(1) # [B, 14, 14]
-            
-            # M_obj_ego needs to be fetched and interpolated
+            M_pred_ego = pred_mask_bin_crop.squeeze(1)  # [B, 14, 14]
+            B_pos = M_pred_ego > thresh_pos
+
             if "input_obj_region_obj_mask" in batch_data:
-                M_obj_ego = F.interpolate(batch_data["input_obj_region_obj_mask"].cuda(), size=14, mode='nearest').squeeze(1)
-                M_obj_ego = (M_obj_ego > 0.5).float()
+                M_obj_ego = F.interpolate(
+                    batch_data["input_obj_region_obj_mask"].cuda(),
+                    size=14,
+                    mode="nearest",
+                ).squeeze(1) > 0.5
             else:
-                 # Fallback if key missing (though updated data_refine should have it)
-                 M_obj_ego = torch.ones_like(B_pos).cuda()
-                 
-            B_neg_background = 1 - M_obj_ego
-            B_neg_object = M_obj_ego * (1 - B_pos)
-            B_neg = (B_neg_background.bool() | (B_neg_object > 0.5).bool()).float()
-            
+                # Fallback: if object mask is unavailable, treat full region as object.
+                M_obj_ego = torch.ones_like(B_pos)
+
+            B_neg_background = ~M_obj_ego
+            B_neg_object_nonpart = M_obj_ego & (~B_pos)
+            B_neg = B_neg_background | B_neg_object_nonpart
+
             pix_contrast_loss_val = pixel_contrast_loss(
-                input_CLIP_feat, 
-                B_pos, 
-                B_neg, 
+                input_CLIP_feat,
+                B_pos.float(),
+                B_neg.float(),
                 num_pos=loss_config.get("pix_contrast_num_pos", 50),
                 num_neg=loss_config.get("pix_contrast_num_neg", 50),
                 tau=loss_config.get("pix_contrast_tau", 0.1)

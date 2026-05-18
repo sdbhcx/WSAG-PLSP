@@ -31,4 +31,9 @@ model:
     use_additional_token: True
     conv_first: True
 
+  use_prompt_learning: True
+  prompt_length: 8
+  prompt_dropout: 0.1
+  prompt_num_heads: 8
+
   margin: 0.1
