@@ -313,16 +313,14 @@ def main(config, seed):
                 ego_obj_mask = batch_data["ego_objbox_mask"].cuda()  # Whole object mask from box
                 exo_obj_mask_full = batch_data["exo_objbox_mask_patch"].cuda()  # [B*num_exo, 196, 1]
                 
-                # Resize masks to match feature dimensions
-                ego_part_mask_resized = F.interpolate(
+                # Resize masks to match feature dimensions using max pooling to preserve small parts
+                ego_part_mask_resized = F.adaptive_max_pool2d(
                     ego_part_mask, 
-                    size=(14, 14),  # Match patch grid size
-                    mode='nearest'
+                    output_size=(14, 14)
                 ).squeeze(1)  # [B, 14, 14]
-                ego_obj_mask_resized = F.interpolate(
+                ego_obj_mask_resized = F.adaptive_max_pool2d(
                     ego_obj_mask, 
-                    size=(14, 14),
-                    mode='nearest'
+                    output_size=(14, 14)
                 ).squeeze(1)  # [B, 14, 14]
                 
                 # Flatten masks to [B, 196]
