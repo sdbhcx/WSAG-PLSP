@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.encoder_clip import VisionTransformer
+from models.encoder_clip import VisionTransformer, DINOv2VisionTransformer
 from models.decoder_affordance import Affordance_Decoder
 from models.SAM_decoder import SAM_Decoder_Simple
 from models.SAM_FPN import SAM_Decoder_FPN
@@ -97,8 +97,25 @@ class ModelAGDsup(nn.Module):
         super().__init__()
 
         self.margin = margin
-        self.encoder = VisionTransformer(
-            input_resolution=img_size, patch_size=patch_size, **encoder_params)
+        encoder_params = dict(encoder_params)
+        if str(encoder_type).lower() in ("dino", "dinov2"):
+            dino_keys = {
+                "model_name",
+                "num_layers",
+                "freeze_backbone",
+                "pretrained",
+                "checkpoint_path",
+                "fuse",
+            }
+            encoder_params = {k: v for k, v in encoder_params.items() if k in dino_keys}
+            self.encoder = DINOv2VisionTransformer(
+                input_resolution=img_size,
+                output_dim=decoder_embed_dim,
+                **encoder_params,
+            )
+        else:
+            self.encoder = VisionTransformer(
+                input_resolution=img_size, patch_size=patch_size, **encoder_params)
         
         self.verb_fuser = Affordance_Decoder(
             num_patches=self.encoder.num_patches,
