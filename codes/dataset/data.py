@@ -31,7 +31,8 @@ class RandomCropBoth(object):
 
 class DatasetAGD_train(torch.utils.data.Dataset):
     def __init__(self, data_dir, split, img_size, exo_obj_file, ego_obj_file, 
-                 num_exo=1, PL_mode=None, aug4imgRatio=0., num_exo_pool=10):
+                 num_exo=1, PL_mode=None, aug4imgRatio=0., num_exo_pool=10,
+                 patch_grid_size=14):
         self.input_paths = []
         self.gt_paths = []
         self.input_verbs = []
@@ -44,6 +45,8 @@ class DatasetAGD_train(torch.utils.data.Dataset):
         self.num_exo_pool = num_exo_pool
         self.PL_mode = PL_mode
         self.aug4imgRatio = aug4imgRatio
+        self.patch_grid_size = patch_grid_size
+        self.patch_grid_size = patch_grid_size
         
         self.noun2verbs = {}
         self.noun2irrelevant_nouns = {}
@@ -231,7 +234,13 @@ class DatasetAGD_train(torch.utils.data.Dataset):
             gt = torch.flip(gt, dims=[2])
             ego_objbox_mask = torch.flip(ego_objbox_mask, dims=[2])
             
-        exo_objbox_mask_patch = all_exo_objbox_masks.resize(self.num_exo, 14, 16, 14, 16).permute(0, 1, 3, 2, 4).reshape(self.num_exo, 14, 14, 256).mean(dim=-1)
+        exo_objbox_mask_patch = F.adaptive_max_pool2d(
+            all_exo_objbox_masks,
+            output_size=(self.patch_grid_size, self.patch_grid_size),
+        )
+        exo_objbox_mask_patch = (exo_objbox_mask_patch > 0).float().reshape(
+            self.num_exo, self.patch_grid_size * self.patch_grid_size, 1
+        )
         exo_objbox_mask_patch = (exo_objbox_mask_patch > 0).float().reshape(self.num_exo, 1, 196) # need this?
         
         if gt.max() == 0: # AGD20K/Seen/testset/GT/hold/bottle/bottle_000341.png
@@ -318,9 +327,9 @@ class DatasetAGD_train(torch.utils.data.Dataset):
         return mask.unsqueeze(0)
         
 
-def get_loader(batch_size, data_dir, img_size, split_file, exo_obj_file, ego_obj_file, train, num_exo=1, num_exo_pool=10, shuffle=True, num_workers=8, PL_mode=None, aug4imgRatio=0., no_pad_gt=False):
+def get_loader(batch_size, data_dir, img_size, split_file, exo_obj_file, ego_obj_file, train, num_exo=1, num_exo_pool=10, shuffle=True, num_workers=8, PL_mode=None, aug4imgRatio=0., no_pad_gt=False, patch_grid_size=14):
     if train:
-        dataset = DatasetAGD_train(data_dir, split_file, img_size, exo_obj_file, ego_obj_file, num_exo=num_exo, num_exo_pool=num_exo_pool, PL_mode=PL_mode, aug4imgRatio=aug4imgRatio)
+        dataset = DatasetAGD_train(data_dir, split_file, img_size, exo_obj_file, ego_obj_file, num_exo=num_exo, num_exo_pool=num_exo_pool, PL_mode=PL_mode, aug4imgRatio=aug4imgRatio, patch_grid_size=patch_grid_size)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_fn_train, num_workers=num_workers)
     else:
         dataset = DatasetAGD_test(data_dir, split_file, img_size, no_pad_gt=no_pad_gt)
@@ -352,7 +361,7 @@ def collate_fn_train(batch):
         "verbs": verbs,
         "nouns": nouns,
         "valid_input": torch.ones(B,),
-        "exo_objbox_mask_patch": exo_objbox_masks_patch.reshape(B*N_E, 196, 1), 
+        "exo_objbox_mask_patch": exo_objbox_masks_patch,
         "input_paths": input_ps,
         "vids": torch.tensor(vids),
         "nids": torch.tensor(nids),

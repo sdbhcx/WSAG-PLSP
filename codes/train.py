@@ -3,7 +3,7 @@ import os
 main_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(main_dir)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 指定你要使用的 GPU 编号
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 指定你要使用的 GPU 编号
 
 import argparse
 import yaml
@@ -154,6 +154,8 @@ def main(config, seed):
     
     load_config = config["load"]
     all_ckpt, encoder_ckpt = load_config["all_ckpt"], load_config["encoder_ckpt"]
+    all_ckpt, encoder_ckpt = load_config["all_ckpt"], load_config["encoder_ckpt"]
+    encoder_type = str(config["model"]["encoder_type"]).lower()
     if all_ckpt:
         with open(all_ckpt, "rb") as f:
             state_dict = torch.load(f)["state_dict"]
@@ -166,7 +168,9 @@ def main(config, seed):
         for ww in w:
             logger.debug(ww)
     else:
-        if config["model"]["encoder_type"] == "CLIP":
+        if encoder_type == "clip":
+            if not encoder_ckpt:
+                raise ValueError("`load.encoder_ckpt` is required when `model.encoder_type` is CLIP.")
             state_dict = torch.jit.load(encoder_ckpt, map_location='cpu').float().state_dict()
             ckpt_dict = {}
             for k, v in state_dict.items():
@@ -174,8 +178,13 @@ def main(config, seed):
                     ckpt_dict[k.split('visual.')[1]] = v
             u, w = model.encoder.load_state_dict(ckpt_dict, False)
             logger.debug(f'{u}, {w} are misaligned params in CLIP Encoder')
+        elif encoder_type in ("dino", "dinov2"):
+            logger.info(
+                "Using DINO/DINOv2 encoder: the main image encoder is initialized from torch.hub, "
+                "and `load.encoder_ckpt` is reserved for the frozen CLIP feature branch."
+            )
         else:
-            assert encoder_ckpt is None
+            raise ValueError(f"Unsupported encoder_type: {config['model']['encoder_type']}")
     
     num_parameters = sum([p.numel() for p in model.parameters()])
     logger.info(f'#Params: {num_parameters}')
@@ -185,6 +194,8 @@ def main(config, seed):
     logger.info(f'#Final Decoder Params: {num_parameters}')    
 
     # define dataloader
+    patch_grid_size = int(np.sqrt(model.encoder.num_patches))
+
     train_data_loader = get_loader(
         batch_size=config["batch_size"],
         img_size=config["img_size"],
@@ -311,24 +322,24 @@ def main(config, seed):
                 # Prepare masks for prototype contrast loss
                 ego_part_mask = batch_data["gt_mask"].cuda()  # [B, 1, H, W]
                 ego_obj_mask = batch_data["ego_objbox_mask"].cuda()  # Whole object mask from box
-                exo_obj_mask_full = batch_data["exo_objbox_mask_patch"].cuda()  # [B*num_exo, 196, 1]
+                exo_obj_mask_full = batch_data["exo_objbox_mask_patch"].cuda()  # [B*num_exo, G*G, 1]
                 
                 # Resize masks to match feature dimensions using max pooling to preserve small parts
                 ego_part_mask_resized = F.adaptive_max_pool2d(
                     ego_part_mask, 
-                    output_size=(14, 14)
-                ).squeeze(1)  # [B, 14, 14]
+                    output_size=(patch_grid_size, patch_grid_size)
+                ).squeeze(1)  # [B, G, G]
                 ego_obj_mask_resized = F.adaptive_max_pool2d(
                     ego_obj_mask, 
-                    output_size=(14, 14)
-                ).squeeze(1)  # [B, 14, 14]
+                    output_size=(patch_grid_size, patch_grid_size)
+                ).squeeze(1)  # [B, G, G]
                 
-                # Flatten masks to [B, 196]
+                # Flatten masks to [B, G*G]
                 ego_part_mask_flat = ego_part_mask_resized.reshape(ego_part_mask_resized.shape[0], -1)
                 ego_obj_mask_flat = ego_obj_mask_resized.reshape(ego_obj_mask_resized.shape[0], -1)
                 
-                # Exo mask is already [B*num_exo, 196, 1], just squeeze
-                exo_obj_mask_full_flat = exo_obj_mask_full.squeeze(-1)  # [B*num_exo, 196]
+                # Exo mask is already [B*num_exo, G*G, 1], just squeeze
+                exo_obj_mask_full_flat = exo_obj_mask_full.squeeze(-1)  # [B*num_exo, G*G]
                 
                 aff_res, sim_loss, exo_cls_res, pred_noun, pred_part, proto_loss = model(
                     batch_data["input_image"], batch_data["sent_feats"], 

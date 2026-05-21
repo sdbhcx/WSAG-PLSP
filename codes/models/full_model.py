@@ -79,6 +79,50 @@ def selective_prototype_contrast_loss(anchor, positives, negatives, temperature=
     return loss
 
 
+class UnifiedCrossModalFusion(nn.Module):
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.text_to_image = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.image_to_text = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm_text_1 = nn.LayerNorm(dim)
+        self.norm_img_1 = nn.LayerNorm(dim)
+        self.norm_text_2 = nn.LayerNorm(dim)
+        self.norm_img_2 = nn.LayerNorm(dim)
+        self.text_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+        self.image_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Linear(dim * 2, dim),
+        )
+
+    def forward(self, image_tokens, text_token):
+        # Text branch attends to image features (text <- image).
+        text_delta, _ = self.text_to_image(query=text_token, key=image_tokens, value=image_tokens, need_weights=False)
+        text_token = self.norm_text_1(text_token + text_delta)
+
+        # Image branch attends to text token (image <- text).
+        img_delta, _ = self.image_to_text(query=image_tokens, key=text_token, value=text_token, need_weights=False)
+        image_tokens = self.norm_img_1(image_tokens + img_delta)
+
+        text_token = self.norm_text_2(text_token + self.text_mlp(text_token))
+        image_tokens = self.norm_img_2(image_tokens + self.image_mlp(image_tokens))
+        return text_token, image_tokens
+
+
 class ModelAGDsup(nn.Module):
     """ Masked Autoencoder with VisionTransformer backbone
     """
@@ -92,11 +136,18 @@ class ModelAGDsup(nn.Module):
                  decoder_layer_scale_init_value=0.1,
                  init_std=0.02, pred_model_type="SAM",
                  pred_decoder_args={"mlp_dim":1024, "depth":2, "use_up":2, "use_additional_token":True},
-                 margin=0.5
-                 ):
+                 margin=0.5,
+                 use_prompt_learning=False,
+                 prompt_length=8,
+                 prompt_dropout=0.1,
+                 prompt_num_heads=8,
+                   use_unified_fusion=True
+                   ):
         super().__init__()
 
         self.margin = margin
+        self.use_unified_fusion = use_unified_fusion
+
         encoder_params = dict(encoder_params)
         if str(encoder_type).lower() in ("dino", "dinov2"):
             dino_keys = {
@@ -116,16 +167,24 @@ class ModelAGDsup(nn.Module):
         else:
             self.encoder = VisionTransformer(
                 input_resolution=img_size, patch_size=patch_size, **encoder_params)
-        
+
+        # Keep legacy fusion path for ablation and backward compatibility.
         self.verb_fuser = Affordance_Decoder(
             num_patches=self.encoder.num_patches,
-            decoder_embed_dim=decoder_embed_dim, regresser_depth=aff_decoder_depth, 
-            num_heads=decoder_num_heads, 
-            mlp_ratio=mlp_ratio, qkv_bias=True, qk_scale=None, 
-            drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate, 
+            decoder_embed_dim=decoder_embed_dim, regresser_depth=aff_decoder_depth,
+            num_heads=decoder_num_heads,
+            mlp_ratio=mlp_ratio, qkv_bias=True, qk_scale=None,
+            drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate,
             norm_layer=norm_layer, init_values=decoder_layer_scale_init_value, init_std=init_std
         )
-        
+
+        if self.use_unified_fusion:
+            self.cross_modal_fuser = UnifiedCrossModalFusion(
+                dim=decoder_embed_dim,
+                num_heads=decoder_num_heads,
+                dropout=attn_drop_rate,
+            )
+
         if pred_model_type == "SAM":
             self.pred_decoder = SAM_Decoder_Simple(
                 transformer_dim=decoder_embed_dim,
@@ -165,12 +224,39 @@ class ModelAGDsup(nn.Module):
             nn.GELU(),
             nn.Linear(512, 512)
         )
+
+        self.use_prompt_learning = use_prompt_learning
+        if self.use_prompt_learning:
+            # Learnable context tokens [V1]...[Vp] that are prepended before the affordance token.
+            self.prompt_context = nn.Parameter(
+                torch.randn(prompt_length, decoder_embed_dim) * init_std
+            )
+            self.prompt_attn = nn.MultiheadAttention(
+                embed_dim=decoder_embed_dim,
+                num_heads=prompt_num_heads,
+                dropout=prompt_dropout,
+                batch_first=True,
+            )
+            self.prompt_norm = nn.LayerNorm(decoder_embed_dim)
+            self.prompt_dropout = nn.Dropout(prompt_dropout)
         
         # self.proto_projector = nn.Sequential(
         #     nn.Linear(512, 512),
         #     nn.GELU(),
         #     nn.Linear(512, 512)
         # )
+
+    def build_prompted_text_feat(self, text_feat):
+        if not self.use_prompt_learning:
+            return text_feat
+
+        B, D = text_feat.shape
+        context = self.prompt_context.unsqueeze(0).expand(B, -1, -1)
+        affordance_token = text_feat.unsqueeze(1)
+        prompt_sequence = torch.cat([context, affordance_token], dim=1)
+        prompt_update, _ = self.prompt_attn(prompt_sequence, prompt_sequence, prompt_sequence, need_weights=False)
+        prompt_sequence = self.prompt_norm(prompt_sequence + self.prompt_dropout(prompt_update))
+        return prompt_sequence[:, -1, :]
         
         
     def forward(self, imgs, text_feat, exo=None, exo_obj_mask=None, num_exo=1, 
@@ -180,15 +266,22 @@ class ModelAGDsup(nn.Module):
 
         # proj_x = self.proto_projector(x)
         # 2. 处理动作语义特征
-        v = text_feat.float().unsqueeze(1)
+        prompted_text_feat = self.build_prompted_text_feat(text_feat.float())
+        v = prompted_text_feat.unsqueeze(1)
         # 3. 预测物体特征
         pred_noun = self.noun_transform(x[:, 0:1, ].detach()) 
         # 4. 融合物体特征和动作语义特征
         pred_part = self.reason(torch.cat([pred_noun, v], dim=2))
-        # 使用 verb_fuser 网络融合视觉特征和融合后的特征
-        aff_token, _, _ = self.verb_fuser(x, pred_part+v)
-        
-        pred_heatmap = self.pred_decoder(x, aff_token)
+        if self.use_unified_fusion:
+            # 在统一双向跨模态模块中同时执行 text<->image 融合
+            aff_token, fused_tokens = self.cross_modal_fuser(x, pred_part + v)
+
+            # 将融合后的 token 与视觉特征直接送入 SAM 头
+            pred_heatmap = self.pred_decoder(fused_tokens, aff_token, skip_transformer=True)
+        else:
+            # 兼容旧路径：先用 verb_fuser 融合，再走 SAM 内部 TwoWay 交互
+            aff_token, _, _ = self.verb_fuser(x, pred_part + v)
+            pred_heatmap = self.pred_decoder(x, aff_token)
 
         # 构建原型用于选择性原型对比损失
         proto_loss = None
@@ -197,7 +290,35 @@ class ModelAGDsup(nn.Module):
             _, exo = self.encoder(exo)
             # proj_exo = self.proto_projector(exo)
 
-            exo_token = (exo[:, 1:] * exo_obj_mask).sum(dim=1)
+            # Ensure exo_obj_mask matches the spatial token count of exo
+            mask = exo_obj_mask
+            if mask is None:
+                mask = torch.ones(exo.shape[0], exo.shape[1] - 1, device=exo.device, dtype=exo.dtype)
+            else:
+                # squeeze trailing singleton if present
+                if mask.dim() == 3 and mask.shape[-1] == 1:
+                    mask = mask.squeeze(-1)
+
+                token_N = exo.shape[1] - 1
+                mask_N = mask.shape[1]
+                if mask_N != token_N:
+                    # try to interpret masks as square grids and resize to token grid
+                    s_mask = int(round(mask_N ** 0.5))
+                    s_feat = int(round(token_N ** 0.5))
+                    if s_mask * s_mask == mask_N and s_feat * s_feat == token_N:
+                        mask = mask.reshape(mask.shape[0], 1, s_mask, s_mask)
+                        mask = F.interpolate(mask, size=(s_feat, s_feat), mode='nearest')
+                        mask = mask.reshape(mask.shape[0], -1)
+                    else:
+                        # fallback: trim or repeat to fit
+                        if mask_N < token_N:
+                            repeat = int(token_N // mask_N)
+                            mask = mask.repeat_interleave(repeat, dim=1)[:, :token_N]
+                        else:
+                            mask = mask[:, :token_N]
+
+            exo_obj_mask = mask.to(exo.dtype)
+            exo_token = (exo[:, 1:] * exo_obj_mask.unsqueeze(-1)).sum(dim=1)
             D = aff_token.shape[-1]
             aff_token_expand = aff_token.expand(-1, num_exo, -1).reshape(-1, D)
             sim_loss = torch.max(
@@ -205,6 +326,7 @@ class ModelAGDsup(nn.Module):
                 torch.zeros(len(exo_token)).to(x.device))
             
             # 构建选择性原型对比损失
+            proto_loss = None
             if ego_part_mask is not None and exo_obj_mask_full is not None:
                 proto_loss = self.compute_prototype_contrast_loss(
                     x, exo, ego_part_mask, ego_obj_mask, 

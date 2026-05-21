@@ -30,7 +30,7 @@ optimizer:
   sche_type: cos
 
 model:
-  encoder_type: CLIP
+  encoder_type: DINO
   encoder_params:
     width: 768
     layers: 12
@@ -46,12 +46,14 @@ model:
     use_additional_token: True
     conv_first: True
 
-  use_prompt_learning: True
+  use_prompt_learning: False
   prompt_length: 16
   prompt_dropout: 0.1
   prompt_num_heads: 8
 
   margin: 0.1
+
+  use_unified_fusion: true
 
 loss:
   kl_loss_coeff: 0.2
@@ -59,5 +61,5 @@ loss:
   exo_cls_coeff: 0.8
   noun_sim_coeff: 0.1
   part_sim_coeff: 0.01
-  proto_loss_coeff: 0.3
+  proto_loss_coeff: 0.4
   conc_loss_coeff: 0.05

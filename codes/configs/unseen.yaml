@@ -1,10 +1,10 @@
 work_dir: &work_dir logs/unseen
 deterministic: False
 
-data_dir: /path/to/AGD20K
+data_dir: /mnt/sdb/wyn/data/AGD20K
 
 load:
-  encoder_ckpt: /path/to/ViT-B-16.pt
+  encoder_ckpt: /mnt/sdb/wyn/model/ViT-B-16.pt
   all_ckpt: # leave blank for training
 
 batch_size: 10 # real batch size = batch_size * accum_iter
@@ -46,12 +46,14 @@ model:
     use_additional_token: True
     conv_first: True
 
-  use_prompt_learning: True
+  use_prompt_learning: False
   prompt_length: 8
   prompt_dropout: 0.1
   prompt_num_heads: 8
 
   margin: 0.1
+
+  use_unified_fusion: False
 
 loss:
   kl_loss_coeff: 1.0
@@ -59,4 +61,5 @@ loss:
   exo_cls_coeff: 10.
   noun_sim_coeff: 1.
   part_sim_coeff: 0.1
-  proto_loss_coeff: 0.1
+  # proto_loss_coeff: 4
+  # conc_loss_coeff: 0.05
