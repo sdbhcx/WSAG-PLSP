@@ -241,7 +241,6 @@ class DatasetAGD_train(torch.utils.data.Dataset):
         exo_objbox_mask_patch = (exo_objbox_mask_patch > 0).float().reshape(
             self.num_exo, self.patch_grid_size * self.patch_grid_size, 1
         )
-        exo_objbox_mask_patch = (exo_objbox_mask_patch > 0).float().reshape(self.num_exo, 1, 196) # need this?
         
         if gt.max() == 0: # AGD20K/Seen/testset/GT/hold/bottle/bottle_000341.png
             gt = torch.ones_like(gt)

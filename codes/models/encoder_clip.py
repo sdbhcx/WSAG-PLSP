@@ -3,6 +3,7 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 from torch import nn
+from .attention import BiLevelRoutingAttention_nchw
 
 
 class LayerNorm(nn.LayerNorm):
@@ -58,6 +59,7 @@ class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int=224, patch_size: int=16, width: int=768, layers: int=12, heads: int=12, output_dim: int=512):
         super().__init__()
         self.input_resolution = input_resolution
+        self.patch_size = patch_size
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
@@ -72,9 +74,20 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
         
         self.num_patches = int((input_resolution // patch_size)**2)
+        self.grid_size = input_resolution // patch_size
+
+        # Insert the spatial module in the middle of the Transformer instead of the stem.
+        # Tokens are already semantically richer here, which usually makes routing attention more stable.
+        desired_window_size = 7
+        n_win = max(1, self.grid_size // desired_window_size)
+        self.bi_attn = BiLevelRoutingAttention_nchw(dim=width, num_heads=heads, n_win=n_win,
+                                qk_scale=None, topk=2, side_dwconv=3, auto_pad=True)
+        self.bi_attn_scale = 0.1
+        self.bi_attn_insert_layer = max(1, layers // 2)
+
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = self.conv1(x)  # shape = [B, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         
@@ -83,7 +96,19 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        for layer_idx, block in enumerate(self.transformer.resblocks):
+            x = block(x)
+            if layer_idx + 1 == self.bi_attn_insert_layer:
+                x = x.permute(1, 0, 2)  # LND -> NLD for spatial attention insertion
+                cls_token = x[:, :1, :]
+                patch_tokens = x[:, 1:, :]
+                patch_tokens = patch_tokens.permute(0, 2, 1).reshape(
+                    x.shape[0], x.shape[2], self.grid_size, self.grid_size
+                )
+                patch_tokens = patch_tokens + self.bi_attn_scale * self.bi_attn(patch_tokens)
+                patch_tokens = patch_tokens.reshape(x.shape[0], x.shape[2], -1).permute(0, 2, 1)
+                x = torch.cat([cls_token, patch_tokens], dim=1).permute(1, 0, 2)  # back to LND
+
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x)
